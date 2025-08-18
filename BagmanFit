@@ -1,0 +1,478 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+/**
+ * BagmanFit — fresh dark-only MVP
+ * Start Workout → add exercises → log sets (weight × reps, optional RPE)
+ * Auto session volume + estimated 1RM (Epley)
+ * History view (per-session breakdown)
+ * Stats with PRs per exercise (Heaviest, Best est. 1RM, Best Set, Best Session Volume)
+ * Exercise Library (add/delete + quick-add with equipment)
+ * Import/Export JSON and Erase All Data
+ * Simple PR animation (no external deps), PRs only recorded on Save
+ */
+
+// ---------- Utils ----------
+const uid = () => Math.random().toString(36).slice(2, 10);
+const est1RM = (weight, reps) => (Number(reps) > 1 ? Number(weight) * (1 + Number(reps) / 30) : Number(weight));
+const vol = (s) => (Number(s.weight) || 0) * (Number(s.reps) || 0);
+const round2 = (n) => (isFinite(n) ? Math.round(n * 100) / 100 : 0);
+
+// ---------- Types (JSDoc) ----------
+/** @typedef {{id:string,name:string,group?:string,equipment?:string}} Exercise */
+/** @typedef {{weight:number|"", reps:number|"", rpe?:number|""}} SetEntry */
+/** @typedef {{exerciseId:string, sets:SetEntry[]}} WorkoutItem */
+/** @typedef {{id:string, date:string, name?:string, notes?:string, items:WorkoutItem[]}} Workout */
+
+// ---------- Seed Library ----------
+const defaultExercises = [
+  { id: uid(), name: "Barbell Bench Press", group: "Chest", equipment: "Barbell" },
+  { id: uid(), name: "Incline Dumbbell Press", group: "Chest", equipment: "Dumbbell" },
+  { id: uid(), name: "Lat Pulldown", group: "Back", equipment: "Cable" },
+  { id: uid(), name: "Seated Row", group: "Back", equipment: "Cable" },
+  { id: uid(), name: "Back Squat", group: "Quads", equipment: "Barbell" },
+  { id: uid(), name: "Leg Press", group: "Quads", equipment: "Machine" },
+  { id: uid(), name: "Deadlift", group: "Back", equipment: "Barbell" },
+  { id: uid(), name: "Overhead Press", group: "Shoulders", equipment: "Barbell" },
+  { id: uid(), name: "Lateral Raise", group: "Shoulders", equipment: "Dumbbell" },
+  { id: uid(), name: "Tricep Pushdown", group: "Triceps", equipment: "Cable" },
+];
+
+const EQUIP_OPTS = ["Barbell","Dumbbell","Cable","Machine","Bodyweight","Kettlebell","Band","Smith","Other"];
+
+export default function BagmanFit() {
+  // Data
+  const [exercises, setExercises] = useState(defaultExercises);
+  const [workouts, setWorkouts] = useState(/** @type {Workout[]} */([]));
+
+  // UI
+  const [tab, setTab] = useState("workout"); // workout | history | stats | library | settings
+  const [showPR, setShowPR] = useState(false);
+
+  // Current session being built
+  const [session, setSession] = useState(/** @type {Workout} */({ id: uid(), date: new Date().toISOString(), name: "", notes: "", items: [] }));
+
+  // Derived maps
+  const exerciseMap = useMemo(() => Object.fromEntries(exercises.map(e=>[e.id, e])), [exercises]);
+
+  // ---------- Session helpers ----------
+  const addExerciseToSession = (exerciseId) => setSession(s => ({ ...s, items: s.items.concat([{ exerciseId, sets: [] }]) }));
+  const addSet = (itemIdx) => setSession(s => {
+    const items = [...s.items];
+    const it = { ...items[itemIdx] };
+    it.sets = [...it.sets, { weight: "", reps: "", rpe: "" }];
+    items[itemIdx] = it;
+    return { ...s, items };
+  });
+  const updateSet = (itemIdx, setIdx, field, value) => setSession(s => {
+    const items = [...s.items];
+    const it = { ...items[itemIdx] };
+    const sets = [...it.sets];
+    sets[setIdx] = { ...sets[setIdx], [field]: value };
+    it.sets = sets; items[itemIdx] = it; return { ...s, items };
+  });
+  const removeSet = (itemIdx, setIdx) => setSession(s=>{
+    const items = [...s.items];
+    const it = { ...items[itemIdx] };
+    it.sets = it.sets.filter((_,i)=>i!==setIdx);
+    items[itemIdx] = it; return { ...s, items };
+  });
+  const removeItem = (itemIdx) => setSession(s => ({ ...s, items: s.items.filter((_,i)=>i!==itemIdx) }));
+
+  const sessionVolume = useMemo(() => session.items.reduce((acc,it)=> acc + it.sets.reduce((a,s)=>a+vol(s),0), 0), [session]);
+
+  // ---------- Save & PRs ----------
+  function computeExercisePRs(exId, list /** @type {Workout[]} */) {
+    let heaviest=0, best1RM=0, bestSet=0, bestSessionVolume=0;
+    for (const w of list) {
+      let exVol=0;
+      for (const it of w.items) if (it.exerciseId===exId) {
+        for (const s of it.sets) {
+          const wt=Number(s.weight)||0, rp=Number(s.reps)||0, score=wt*rp;
+          heaviest=Math.max(heaviest, wt);
+          best1RM=Math.max(best1RM, est1RM(wt, rp));
+          bestSet=Math.max(bestSet, score);
+          exVol += score;
+        }
+      }
+      bestSessionVolume=Math.max(bestSessionVolume, exVol);
+    }
+    return { heaviest, best1RM: round2(best1RM), bestSet, bestSessionVolume };
+  }
+
+  const finishWorkout = () => {
+    // clean sets
+    const cleaned = {
+      ...session,
+      items: session.items
+        .map(it => ({ ...it, sets: it.sets.filter(s=> Number(s.weight)>0 && Number(s.reps)>0) }))
+        .filter(it => it.sets.length>0),
+    };
+    if (!cleaned.items.length) { alert("Add at least one valid set."); return; }
+
+    // Check PRs against history (only on save)
+    let hit = false;
+    for (const it of cleaned.items) {
+      const prev = computeExercisePRs(it.exerciseId, workouts);
+      const thisHeaviest = it.sets.reduce((m,s)=>Math.max(m, Number(s.weight)||0), 0);
+      const thisBest1RM = it.sets.reduce((m,s)=>Math.max(m, est1RM(Number(s.weight)||0, Number(s.reps)||0)), 0);
+      const thisBestSet = it.sets.reduce((m,s)=>Math.max(m, vol(s)), 0);
+      if (thisHeaviest > prev.heaviest) hit = true;
+      if (thisBest1RM > prev.best1RM) hit = true;
+      if (thisBestSet > prev.bestSet) hit = true;
+    }
+    const prevBestSessionVol = Math.max(0, ...workouts.map(w=> w.items.reduce((acc,it)=> acc + it.sets.reduce((a,s)=>a+vol(s),0),0)));
+    if (sessionVolume > prevBestSessionVol) hit = true;
+
+    setWorkouts(ws => [{ ...cleaned }, ...ws]);
+    setSession({ id: uid(), date: new Date().toISOString(), name: "", notes: "", items: [] });
+    setTab("history");
+    if (hit) setShowPR(true);
+  };
+
+  // ---------- Small UI bits ----------
+  const baseInput = "rounded-xl px-3 py-2 text-sm border border-neutral-700 bg-neutral-800 text-neutral-100 focus:outline-none focus:ring-2 focus:ring-white/20";
+  const Input = (props) => <input {...props} className={`${baseInput} ${props.className||''}`} />;
+  const Select = (props) => <select {...props} className={`${baseInput} ${props.className||''}`} />;
+  const NavTab = ({id,label}) => (
+    <button onClick={()=>setTab(id)} className={`px-4 py-2 rounded-2xl text-sm border ${tab===id? 'bg-white text-black border-white' : 'bg-neutral-900 text-neutral-200 border-neutral-700 hover:bg-neutral-800'}`}>{label}</button>
+  );
+
+  // ---------- Tabs ----------
+  const WorkoutTab = () => {
+    const [picker, setPicker] = useState(exercises[0]?.id || "");
+    useEffect(()=>{ if (!exercises.find(e=>e.id===picker)) setPicker(exercises[0]?.id||""); }, [exercises]);
+
+    return (
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="lg:col-span-2 bg-neutral-900/80 border border-neutral-800 rounded-2xl p-4">
+          <div className="flex flex-wrap gap-2 mb-3">
+            <Input placeholder="Session Name (optional)" value={session.name} onChange={(e)=>setSession({...session, name:e.target.value})} />
+            <Select value={picker} onChange={(e)=>setPicker(e.target.value)}>
+              {exercises.map(e=> <option key={e.id} value={e.id}>{e.name} {e.group?`• ${e.group}`:''} {e.equipment?`• ${e.equipment}`:''}</option>)}
+            </Select>
+            <button onClick={()=>picker && addExerciseToSession(picker)} className="px-3 py-2 rounded-xl bg-white text-black text-sm">Add</button>
+          </div>
+
+          {session.items.length===0 && <div className="text-sm text-neutral-400">Add an exercise to start logging sets (weight × reps, RPE optional).</div>}
+
+          <div className="space-y-4">
+            {session.items.map((it, idx)=>{
+              const ex = exerciseMap[it.exerciseId];
+              const name = ex ? ex.name : 'Unknown';
+              const itemVol = it.sets.reduce((a,s)=>a+vol(s),0);
+              const bestE1 = it.sets.reduce((m,s)=>Math.max(m, est1RM(Number(s.weight)||0, Number(s.reps)||0)), 0);
+              return (
+                <div key={idx} className="border border-neutral-800 rounded-2xl p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <div>
+                      <div className="font-medium">{name}</div>
+                      <div className="text-xs text-neutral-400">{ex?.group||'Uncategorized'} {ex?.equipment?`• ${ex.equipment}`:''}</div>
+                      <div className="text-xs text-neutral-400 mt-1">Volume: {itemVol} lbs • Best est. 1RM: {round2(bestE1)}</div>
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={()=>addSet(idx)} className="px-3 py-1.5 rounded-xl bg-white text-black text-xs">+ Set</button>
+                      <button onClick={()=>removeItem(idx)} className="px-3 py-1.5 rounded-xl border border-neutral-700 text-xs">Remove</button>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left text-neutral-400">
+                          <th className="py-2 pr-2">#</th>
+                          <th className="py-2 pr-2">Weight (lb)</th>
+                          <th className="py-2 pr-2">Reps</th>
+                          <th className="py-2 pr-2">RPE</th>
+                          <th className="py-2 pr-2">Volume</th>
+                          <th className="py-2 pr-2">est. 1RM</th>
+                          <th className="py-2 pr-2"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {it.sets.map((s, si)=>(
+                          <tr key={si} className="border-t border-neutral-800 odd:bg-neutral-900 even:bg-neutral-950">
+                            <td className="py-2 pr-2 text-neutral-400">{si+1}</td>
+                            <td className="py-2 pr-2"><Input type="number" step="0.5" value={s.weight} onChange={(e)=>updateSet(idx, si, 'weight', e.target.value===''? '': Number(e.target.value))} className="w-28"/></td>
+                            <td className="py-2 pr-2"><Input type="number" value={s.reps} onChange={(e)=>updateSet(idx, si, 'reps', e.target.value===''? '': Number(e.target.value))} className="w-24"/></td>
+                            <td className="py-2 pr-2"><Input type="number" step="0.5" placeholder="(opt)" value={s.rpe ?? ''} onChange={(e)=>updateSet(idx, si, 'rpe', e.target.value===''? '': Number(e.target.value))} className="w-24"/></td>
+                            <td className="py-2 pr-2">{vol(s)}</td>
+                            <td className="py-2 pr-2">{round2(est1RM(Number(s.weight)||0, Number(s.reps)||0))}</td>
+                            <td className="py-2 pr-2"><button onClick={()=>removeSet(idx, si)} className="px-2 py-1 rounded-lg text-xs border border-neutral-700">Remove</button></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="mt-4"><Input placeholder="Session notes (optional)" value={session.notes} onChange={(e)=>setSession({...session, notes:e.target.value})} className="w-full"/></div>
+          <div className="mt-3 text-sm text-neutral-300">Session Volume: <span className="font-semibold text-neutral-100">{sessionVolume} lbs</span></div>
+          <div className="mt-4"><button onClick={finishWorkout} className="px-4 py-2 rounded-xl bg-white text-black text-sm">Save Workout</button></div>
+        </div>
+
+        <div className="space-y-6">
+          <div className="bg-neutral-900/80 border border-neutral-800 rounded-2xl p-4">
+            <div className="text-sm text-neutral-300">Quick Add</div>
+            <div className="flex flex-wrap gap-2 mt-2">
+              {["Barbell Bench Press","Incline Dumbbell Press","Lat Pulldown","Back Squat","Leg Press","Seated Row","Overhead Press","Lateral Raise"].map((name)=>{
+                const ex = exercises.find(e=>e.name===name); if (!ex) return null;
+                return <button key={ex.id} onClick={()=>addExerciseToSession(ex.id)} className="px-3 py-1.5 rounded-full border border-neutral-700 text-xs bg-neutral-800 hover:bg-neutral-700">{name}</button>
+              })}
+            </div>
+          </div>
+
+          <div className="bg-neutral-900/80 border border-neutral-800 rounded-2xl p-4">
+            <div className="text-sm text-neutral-300">What’s next</div>
+            <ul className="list-disc pl-5 text-sm text-neutral-400 mt-2 space-y-1">
+              <li>Use it as-is: log a session in Workout, peek at History/Stats.</li>
+              <li>Desktop app: wrap in Tauri/Electron.</li>
+              <li>Go mobile: React Native/Expo + SQLite, add cloud sync later.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const HistoryTab = () => (
+    <div className="space-y-4">
+      {workouts.length===0 && <div className="text-sm text-neutral-400">No workouts yet. Log one in the Workout tab.</div>}
+      {workouts.map((w)=>{
+        const volSum = w.items.reduce((acc,it)=> acc + it.sets.reduce((a,s)=>a+vol(s),0), 0);
+        return (
+          <div key={w.id} className="border border-neutral-800 rounded-2xl p-4 bg-neutral-900/80">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="font-semibold">{w.name || 'Untitled Session'}</div>
+                <div className="text-xs text-neutral-400">{new Date(w.date).toLocaleString()}</div>
+              </div>
+              <div className="text-sm">Volume: <span className="font-semibold">{volSum} lbs</span></div>
+            </div>
+            {w.notes && <div className="mt-1 text-sm text-neutral-200">Notes: {w.notes}</div>}
+            <div className="mt-3 overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-neutral-400">
+                    <th className="py-2 pr-2">Exercise</th>
+                    <th className="py-2 pr-2">Sets</th>
+                    <th className="py-2 pr-2">Best est. 1RM</th>
+                    <th className="py-2 pr-2">Exercise Volume</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {w.items.map((it, iidx)=>{
+                    const ex = exerciseMap[it.exerciseId];
+                    const exName = ex ? ex.name : 'Unknown Exercise';
+                    const best1 = it.sets.reduce((m,s)=>Math.max(m, est1RM(Number(s.weight)||0, Number(s.reps)||0)), 0);
+                    const v = it.sets.reduce((a,s)=>a+vol(s),0);
+                    return (
+                      <tr key={iidx} className="border-t border-neutral-800">
+                        <td className="py-2 pr-2">{exName}</td>
+                        <td className="py-2 pr-2 text-neutral-200">
+                          {it.sets.map((s, si)=>(
+                            <span key={si} className="inline-block mr-2 mb-1 px-2 py-1 rounded-lg border border-neutral-800 bg-neutral-800/60">{s.weight}×{s.reps}{typeof s.rpe==='number'&& s.rpe!==0 ? ` @RPE ${s.rpe}`:''}</span>
+                          ))}
+                        </td>
+                        <td className="py-2 pr-2">{round2(best1)}</td>
+                        <td className="py-2 pr-2">{v} lbs</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  const StatsTab = () => (
+    <div className="space-y-4">
+      {exercises.map((ex)=>{
+        // compute PRs per exercise across all workouts
+        const prs = (function(){
+          let heaviest=0, best1RM=0, bestSet=0, bestSessionVolume=0;
+          for (const w of workouts) {
+            let exVol=0;
+            for (const it of w.items) if (it.exerciseId===ex.id) {
+              for (const s of it.sets) {
+                const wt=Number(s.weight)||0, rp=Number(s.reps)||0, score=wt*rp;
+                heaviest=Math.max(heaviest, wt);
+                best1RM=Math.max(best1RM, est1RM(wt, rp));
+                bestSet=Math.max(bestSet, score);
+                exVol += score;
+              }
+            }
+            bestSessionVolume=Math.max(bestSessionVolume, exVol);
+          }
+          return { heaviest, best1RM: round2(best1RM), bestSet, bestSessionVolume };
+        })();
+        const has = prs.heaviest>0 || prs.bestSessionVolume>0;
+        return (
+          <div key={ex.id} className="border border-neutral-800 rounded-2xl p-4 bg-neutral-900/80">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="font-semibold">{ex.name}</div>
+                <div className="text-xs text-neutral-400">{ex.group||'Uncategorized'} {ex.equipment?`• ${ex.equipment}`:''}</div>
+              </div>
+              {!has && <div className="text-xs text-neutral-500">No data yet</div>}
+            </div>
+            {has && (
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 text-sm">
+                <Stat label="Heaviest" value={`${prs.heaviest} lb`} />
+                <Stat label="Best est. 1RM" value={`${prs.best1RM}`} />
+                <Stat label="Best Set" value={`${prs.bestSet} lb·reps`} />
+                <Stat label="Best Session Vol." value={`${prs.bestSessionVolume} lb`} />
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  const Stat = ({label, value}) => (
+    <div className="rounded-2xl border border-neutral-800 p-3 bg-neutral-900">
+      <div className="text-xs text-neutral-400">{label}</div>
+      <div className="text-base font-semibold">{value}</div>
+    </div>
+  );
+
+  const LibraryTab = () => {
+    const [newName, setNewName] = useState("");
+    const [newGroup, setNewGroup] = useState("");
+    const [newEquip, setNewEquip] = useState("Dumbbell");
+
+    const addExercise = () => {
+      const name = newName.trim(); if (!name) return;
+      setExercises(xs => xs.concat([{ id: uid(), name, group: newGroup.trim()||undefined, equipment: newEquip }]));
+      setNewName(""); setNewGroup(""); setNewEquip("Dumbbell");
+    };
+    const removeExercise = (id) => {
+      if (!confirm("Delete this exercise? It will remain in past workouts.")) return;
+      setExercises(xs => xs.filter(x=>x.id!==id));
+    };
+
+    return (
+      <div className="space-y-6">
+        <div className="bg-neutral-900/80 border border-neutral-800 rounded-2xl p-4">
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+            <Input placeholder="Exercise name" value={newName} onChange={(e)=>setNewName(e.target.value)} />
+            <Input placeholder="Muscle group (optional)" value={newGroup} onChange={(e)=>setNewGroup(e.target.value)} />
+            <Select value={newEquip} onChange={(e)=>setNewEquip(e.target.value)}>{EQUIP_OPTS.map(o=> <option key={o} value={o}>{o}</option>)}</Select>
+            <button onClick={addExercise} className="px-4 py-2 rounded-xl bg-white text-black text-sm">Add</button>
+            <div className="text-xs text-neutral-400 self-center">Tip: use Quick Add on Workout to insert favorites fast.</div>
+          </div>
+        </div>
+
+        <div className="bg-neutral-900/80 border border-neutral-800 rounded-2xl p-4">
+          <div className="grid md:grid-cols-2 gap-3">
+            {exercises.map(ex => (
+              <div key={ex.id} className="border border-neutral-800 rounded-2xl p-3 flex items-center justify-between bg-neutral-900">
+                <div>
+                  <div className="font-medium">{ex.name}</div>
+                  <div className="text-xs text-neutral-400">{ex.group||'Uncategorized'} {ex.equipment?`• ${ex.equipment}`:''}</div>
+                </div>
+                <div className="flex gap-2">
+                  <button onClick={()=>addExerciseToSession(ex.id)} className="px-3 py-1.5 rounded-xl bg-white text-black text-xs">Add to Session</button>
+                  <button onClick={()=>removeExercise(ex.id)} className="px-3 py-1.5 rounded-xl border border-neutral-700 text-xs">Delete</button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const SettingsTab = () => {
+    const fileRef = useRef(null);
+
+    const exportJSON = () => {
+      const data = JSON.stringify({ exercises, workouts }, null, 2);
+      const blob = new Blob([data], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = `bagmanfit-${new Date().toISOString().slice(0,10)}.json`; a.click();
+      URL.revokeObjectURL(url);
+    };
+    const importJSON = (text) => {
+      try { const parsed = JSON.parse(text); if (parsed.exercises && parsed.workouts) { setExercises(parsed.exercises); setWorkouts(parsed.workouts); alert('Import successful.'); } else alert('Invalid file.'); } catch(e){ alert('Failed to parse JSON: '+e.message); }
+    };
+    const resetAll = () => { if (confirm('Erase ALL data?')) { setExercises(defaultExercises); setWorkouts([]); } };
+
+    return (
+      <div className="space-y-6">
+        <div className="bg-neutral-900/80 border border-neutral-800 rounded-2xl p-4">
+          <div className="text-sm font-semibold mb-2">Data</div>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={exportJSON} className="px-4 py-2 rounded-xl bg-white text-black text-sm">Export JSON</button>
+            <input ref={fileRef} type="file" accept="application/json" className="hidden" onChange={(e)=>{ const f=e.target.files?.[0]; if(!f) return; const r=new FileReader(); r.onload=()=>importJSON(String(r.result)); r.readAsText(f); e.currentTarget.value=''; }} />
+            <button onClick={()=>fileRef.current?.click()} className="px-4 py-2 rounded-xl border border-neutral-700 text-sm">Import JSON</button>
+            <button onClick={resetAll} className="px-4 py-2 rounded-xl border border-neutral-700 text-sm">Erase All Data</button>
+          </div>
+        </div>
+
+        <div className="bg-neutral-900/80 border border-neutral-800 rounded-2xl p-4">
+          <div className="text-sm font-semibold mb-2">Upgrades I can wire in next</div>
+          <ul className="list-disc pl-5 text-sm text-neutral-400 mt-2 space-y-1">
+            <li>Rest timers, plate math, RIR/RPE targets</li>
+            <li>Templates for Push/Legs/Pull + Bench progression</li>
+            <li>Charts (volume, e1RM, weekly PRs)</li>
+            <li>Cloud backup (Supabase/Firebase) + sign-in</li>
+            <li>Hevy import helper (CSV/JSON)</li>
+          </ul>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-neutral-950 text-neutral-100">
+      <style>{`
+        @keyframes pop{0%{transform:scale(.9);opacity:0}100%{transform:scale(1);opacity:1}}
+        @keyframes confetti{0%{transform:translate(0,0) scale(0);opacity:0}100%{transform:translate(var(--x),var(--y)) scale(1);opacity:1}}
+      `}</style>
+      <div className="max-w-6xl mx-auto px-4 py-6 md:py-10">
+        <header className="mb-6 md:mb-8">
+          <div className="flex items-center justify-between">
+            <h1 className="text-2xl md:text-3xl font-bold tracking-tight">BagmanFit — Hevy-Style Tracker (MVP)</h1>
+            <nav className="flex gap-2">
+              <NavTab id="workout" label="Workout" />
+              <NavTab id="history" label="History" />
+              <NavTab id="stats" label="Stats" />
+              <NavTab id="library" label="Library" />
+              <NavTab id="settings" label="Settings" />
+            </nav>
+          </div>
+          <p className="text-sm text-neutral-400 mt-2">Local-first • Dark-only • Fast logging • No external UI deps</p>
+        </header>
+
+        {tab==='workout' && <WorkoutTab />}
+        {tab==='history' && <HistoryTab />}
+        {tab==='stats' && <StatsTab />}
+        {tab==='library' && <LibraryTab />}
+        {tab==='settings' && <SettingsTab />}
+      </div>
+
+      {/* PR celebration (CSS only; click to dismiss) */}
+      {showPR && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={()=>setShowPR(false)}>
+          <div className="relative w-64 h-64 rounded-full bg-emerald-500/15 border-2 border-emerald-400/60 backdrop-blur-sm flex items-center justify-center shadow-[0_0_40px_rgba(16,185,129,0.35)] animate-[pop_0.35s_ease-out]">
+            <div className="text-center">
+              <div className="text-3xl font-extrabold text-emerald-300">PR Unlocked!</div>
+              <div className="text-sm text-emerald-200/90">New personal best recorded.</div>
+            </div>
+            {[ [100,0],[-100,0],[0,100],[0,-100],[70,70],[-70,70],[70,-70],[-70,-70] ].map(([x,y],k)=>(
+              <span key={k} style={{"--x": `${x}px`, "--y": `${y}px`}} className="absolute left-1/2 top-1/2 w-2 h-2 rounded-full bg-emerald-400 animate-[confetti_420ms_ease-out_forwards]" />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
